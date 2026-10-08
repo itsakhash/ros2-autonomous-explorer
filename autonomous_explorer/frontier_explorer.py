@@ -8,9 +8,9 @@ reached is stale and is blacklisted instead of revisited. When no usable frontie
 for several consecutive checks, exploration is finished: a summary is logged, the map is
 optionally saved, and the node exits.
 
-At startup SLAM Toolbox only has a sliver of map (it needs the robot to move or turn
-before it adds more), so if no frontier exists before the first goal, the robot spins
-in place for up to one turn to let the map build up.
+At startup the robot can be boxed in by obstacles, so its first map is tiny and may have
+no usable frontier. A 360-degree lidar learns nothing by turning in place, so in that case
+the robot drives a short way to a known-free cell (a "seed" move) to widen its view.
 """
 
 import math
@@ -19,7 +19,6 @@ import subprocess
 import numpy as np
 import rclpy
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
@@ -28,6 +27,27 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from tf2_ros import Buffer, TransformException, TransformListener
 
 from autonomous_explorer.frontier import choose_frontier, find_frontiers
+
+
+def pick_seed_cell(
+    grid, robot_cell, free_max, min_dist, max_dist, blacklist=(), blacklist_radius=0.0
+):
+    """Return a known-free (x, y) cell a short drive from the robot, or None.
+
+    Distances are in cells. Picks the farthest free cell within max_dist (and at
+    least min_dist away), skipping cells near blacklisted ones.
+    """
+    ys, xs = np.nonzero((grid >= 0) & (grid <= free_max))
+    if xs.size == 0:
+        return None
+    dist = np.hypot(xs - robot_cell[0], ys - robot_cell[1])
+    ok = (dist >= min_dist) & (dist <= max_dist)
+    for bx, by in blacklist:
+        ok &= np.hypot(xs - bx, ys - by) > blacklist_radius
+    if not ok.any():
+        return None
+    best = int(np.argmax(np.where(ok, dist, -1.0)))
+    return int(xs[best]), int(ys[best])
 
 
 class FrontierExplorer(Node):
@@ -43,8 +63,12 @@ class FrontierExplorer(Node):
         self.declare_parameter("idle_ticks_to_finish", 3)  # checks with no frontier
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("save_map_prefix", "")  # e.g. /home/me/maps/explored
-        self.declare_parameter("spin_speed", 0.6)  # rad/s, startup spin
-        self.declare_parameter("max_spin_ticks", 12)  # ~1 turn at 1 tick per second
+        self.declare_parameter(
+            "min_known_area", 10.0
+        )  # m^2, below this the map is "tiny"
+        self.declare_parameter("max_seed_goals", 4)  # startup moves allowed
+        self.declare_parameter("seed_min_dist", 0.5)  # metres
+        self.declare_parameter("seed_max_dist", 1.0)  # metres
 
         self.map = None
         self.busy = False
@@ -56,8 +80,7 @@ class FrontierExplorer(Node):
         self.blacklist = []
         self.reached = []
         self.idle_ticks = 0
-        self.spin_ticks = 0
-        self.spinning = False
+        self.seed_goals = 0
         self.goals_sent = 0
         self.goals_succeeded = 0
         self.goals_failed = 0
@@ -71,8 +94,6 @@ class FrontierExplorer(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
         self.create_subscription(OccupancyGrid, "map", self.on_map, map_qos)
-        # Goes through the twist_relay node, which converts it to TwistStamped on /cmd_vel.
-        self.spin_pub = self.create_publisher(Twist, "cmd_vel_nav2", 10)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.nav = ActionClient(self, NavigateToPose, "navigate_to_pose")
@@ -98,19 +119,8 @@ class FrontierExplorer(Node):
             return None
         return tf.transform.translation.x, tf.transform.translation.y
 
-    def spin_robot(self):
-        msg = Twist()
-        msg.angular.z = float(self.param("spin_speed"))
-        self.spin_pub.publish(msg)
-        self.spinning = True
-
-    def stop_spin(self):
-        if self.spinning:
-            self.spin_pub.publish(Twist())  # all zeros: stop
-            self.spinning = False
-
     def is_revisit(self, cell, res):
-        """True if this frontier is next to a place the robot already reached."""
+        """Return True if this frontier is next to a place the robot already reached."""
         limit = self.param("revisit_radius")
         return any(
             math.hypot(cell[0] - c[0], cell[1] - c[1]) * res < limit
@@ -180,19 +190,34 @@ class FrontierExplorer(Node):
             return
 
         if target is None:
-            # Before the first goal the map is only a sliver: turn in place so SLAM
-            # sees more of the room instead of concluding there is nothing to explore.
-            if self.goals_sent == 0 and self.spin_ticks < self.param("max_spin_ticks"):
-                self.spin_ticks += 1
-                self.spin_robot()
-                return
-            self.stop_spin()
+            # A tiny map with no usable frontier means the robot is boxed in at the
+            # start. Move to a nearby free cell so the lidar sees more.
+            if known_area < self.param(
+                "min_known_area"
+            ) and self.seed_goals < self.param("max_seed_goals"):
+                seed = pick_seed_cell(
+                    grid,
+                    robot_cell,
+                    self.param("free_max"),
+                    self.param("seed_min_dist") / res,
+                    self.param("seed_max_dist") / res,
+                    self.blacklist,
+                    self.param("blacklist_radius") / res,
+                )
+                if seed is not None:
+                    self.seed_goals += 1
+                    self.idle_ticks = 0
+                    self.get_logger().info(
+                        "map is tiny with no usable frontier: "
+                        f"seed move {self.seed_goals} to a nearby free cell"
+                    )
+                    self.send_goal(seed, xy, info)
+                    return
             self.idle_ticks += 1
             if self.idle_ticks >= self.param("idle_ticks_to_finish"):
                 self.finish(grid, res)
             return
 
-        self.stop_spin()
         self.idle_ticks = 0
         self.send_goal(target, xy, info)
 
@@ -216,7 +241,7 @@ class FrontierExplorer(Node):
         self.goal_cell = cell
         self.goal_sent_at = self.now_s()
         self.get_logger().info(
-            f"goal {self.goals_sent}: frontier at ({wx:.2f}, {wy:.2f}) m"
+            f"goal {self.goals_sent}: target at ({wx:.2f}, {wy:.2f}) m"
         )
         self.nav.send_goal_async(goal).add_done_callback(self.on_goal_response)
 
@@ -267,7 +292,7 @@ class FrontierExplorer(Node):
             f"{elapsed:.0f} s (simulation time), "
             f"{self.goals_sent} goals ({self.goals_succeeded} reached, "
             f"{self.goals_failed} failed), {self.goals_skipped} stale frontiers skipped, "
-            f"mapped area {known_area:.1f} m^2"
+            f"{self.seed_goals} startup seed moves, mapped area {known_area:.1f} m^2"
         )
         prefix = self.param("save_map_prefix")
         if prefix:
@@ -298,7 +323,6 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        node.stop_spin()
         node.destroy_node()
         rclpy.try_shutdown()
 
